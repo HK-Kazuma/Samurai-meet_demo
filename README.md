@@ -1,6 +1,126 @@
 # Samurai Meet
 
+[🇯🇵 日本語](README.md) | [🇬🇧 English](README.en.md)
+
 日本国内で、短い空き時間に近くの日本人・外国人が交流相手を募集し、条件が合えばマッチングするアプリです。正式な実装契約は [docs/README.md](docs/README.md)、Go APIの厳密な契約は [backend/API_SPEC.md](backend/API_SPEC.md) を参照してください。
+
+## クイックスタート（自分のPCでデモを動かす）
+
+バックエンド（Go API + PostgreSQL）とフロントエンド（Expo/React Native）の2つで構成されます。共有のクラウドサーバーは使わず、自分のPC上にバックエンドをDockerで起動し、同じWi-Fi内のスマートフォンからExpo Go経由で動作を確認します。
+
+### 前提条件
+
+- [Docker Desktop](https://www.docker.com/products/docker-desktop/)（Docker Composeを含む）。Goのツールチェインはコンテナ内でビルドされるため、ホストPCへのGoインストールは不要です
+- [Bun](https://bun.sh/)（フロントエンドの依存関係取得・起動に使用）
+- スマートフォンに **Expo Go** アプリ（iOS App Store / Google Play）をインストール
+- PCとスマートフォンが同じWi-Fiネットワークに接続されていること
+- （任意）募集作成時の分類機能まで試す場合は、Google AI Studioで取得できるGemini APIキー。未設定でも起動はできますが、募集の分類APIが503になります
+
+### 1. リポジトリを取得する
+
+```bash
+git clone <このリポジトリのURL>
+cd Samurai-meet_demo
+```
+
+### 2. PCのLAN IPを確認する
+
+スマートフォンから到達できるPCのIPアドレスを先に確認します。
+
+- Windows (PowerShell): `Get-NetIPAddress -InterfaceAlias "Wi-Fi" -AddressFamily IPv4 | Select-Object IPAddress` または `ipconfig`
+- macOS: `ipconfig getifaddr en0`（Wi-Fiインターフェース名が異なる場合は`en1`なども確認）
+- Linux: `hostname -I` または `ip addr show`
+
+VMwareやWSLなどの仮想アダプタのIPが混在する環境があります。実機から到達できるのは、実際にWi-Fiへ接続しているアダプタのIPだけです。
+
+### 3. バックエンドをDockerで起動する
+
+```bash
+cd backend
+cp .env.example .env
+```
+
+`backend/.env` を開き、Demoアカウントでのログインに必須の項目を設定します。
+
+```
+APP_ENV=development
+DEMO_ACCOUNT_ENABLED=true
+GOOGLE_LOGIN_ENABLED=false
+DB_NAME=samurai_meet_demo
+IMAGE_STORAGE_DIR=storage/demo-images
+JWS_SIGNING_KEY=<32 bytesのBase64URL値>
+DEV_CLIENT_ORIGIN=http://<手順2で確認したLAN IP>:8081
+GEMINI_API_KEY=<任意。分類機能まで試す場合に設定>
+```
+
+`JWS_SIGNING_KEY` は次のコマンドで生成できます。
+
+```bash
+python scripts/generate_dev_keys.py --server-only
+```
+
+設定できたら、PostgreSQLとAPIサーバーをまとめてビルド・起動します。
+
+```bash
+docker compose up -d --build
+```
+
+初回はDockerイメージのビルドに数分かかります。起動を確認します。
+
+```bash
+curl http://localhost:8080/healthz
+# {"status":"ok"}
+```
+
+### 4. フロントエンドを起動する
+
+```bash
+cd ../frontend
+bun install
+cp .env.example .env
+```
+
+`frontend/.env` を編集します。
+
+```
+EXPO_PUBLIC_API_BASE_URL=http://<手順2で確認したLAN IP>:8080/api/v1
+EXPO_PUBLIC_WEB_APP_ORIGIN=http://<手順2で確認したLAN IP>:8081
+EXPO_PUBLIC_DEMO_ACCOUNT_ENABLED=true
+```
+
+Metro（Expoの開発サーバー）を、スマートフォンから見えるLAN IPを明示して起動します。自動検出だと仮想アダプタのIPが選ばれることがあるため、`REACT_NATIVE_PACKAGER_HOSTNAME`で明示します。
+
+- Windows (PowerShell):
+  ```powershell
+  $env:REACT_NATIVE_PACKAGER_HOSTNAME="<手順2で確認したLAN IP>"
+  bun run start:offline
+  ```
+- macOS/Linux (bash/zsh):
+  ```bash
+  export REACT_NATIVE_PACKAGER_HOSTNAME="<手順2で確認したLAN IP>"
+  bun run start:offline
+  ```
+
+`start:offline`（`expo start --offline --lan`）は、Expoアカウントへのログインなしで同一LAN内から確認するためのコマンドです。表示されるURLが`exp://<手順2で確認したLAN IP>:8081`になっていることを確認してください。
+
+### 5. スマートフォンで確認する
+
+1. Expo GoアプリでQRコードを読み込みます。
+2. 未ログイン画面で「デモを体験する」をタップし、表示言語と利用モード（外国人側／日本人側）を選びます。メール登録やPasskeyは不要でアカウントが発行されます（24時間で失効します）。
+
+マッチングまで確認する場合は、2台の端末（または1台でログアウト・再発行を繰り返す）を用意し、一方を外国人側（募集者）、もう一方を日本人側（応募者）にして、募集作成・公開 → 検索・応募 → 承認 → アプリ内通知の順に試してください。
+
+### うまくいかないとき
+
+| 症状 | 原因と対処 |
+| --- | --- |
+| Expo GoでQRを読むとタイムアウトする | PCとスマホが同じWi-Fiに接続されているか確認する。`REACT_NATIVE_PACKAGER_HOSTNAME`が仮想アダプタのIPになっていないか確認する |
+| PCの`curl`は成功するがスマホから繋がらない | Windowsでは、Wi-Fiのネットワークプロファイルが「パブリック」のままか、ファイアウォールで8080・8081番ポートが許可されていない可能性があります |
+| `docker compose up`で`configuration validation failed: demo configuration is unsafe`と出る | `backend/.env`のDemoモード必須設定（`GOOGLE_LOGIN_ENABLED=false`、`DB_NAME=samurai_meet_demo`、`IMAGE_STORAGE_DIR=storage/demo-images`、`JWS_SIGNING_KEY`）を見直してください |
+| 募集の確認画面で分類が503になる | `GEMINI_API_KEY`が未設定または無効です |
+| PCのIPが変わった | `backend/.env`の`DEV_CLIENT_ORIGIN`と`frontend/.env`の`EXPO_PUBLIC_API_BASE_URL`・`EXPO_PUBLIC_WEB_APP_ORIGIN`を新しいIPに更新し、`docker compose up -d --build`とExpoを起動し直します |
+
+Windowsのファイアウォール設定など、より詳しい手順は [ローカル起動確認の手順](docs/human/local-dev-runbook.md) を参照してください。
 
 ## 現在の実装状態
 
@@ -16,6 +136,8 @@
 未完了項目の正本は [実装状態とバックログ](docs/ai/plans/backlog.md) です。仕様上の目標と現在の実装を混同しないでください。
 
 ## 接続先
+
+上記クイックスタートでは、ローカルに起動したAPI（`http://<PCのLAN IP>:8080/api/v1`）へ接続します。接続先を切り替える一般的な挙動は次のとおりです。
 
 - iPhoneを含むネイティブクライアントの既定値: `https://samurai-meet.disnana.com/api/v1`
 - ローカルGo API: `EXPO_PUBLIC_API_BASE_URL` に端末から到達できるURLを明示した場合だけ使用
