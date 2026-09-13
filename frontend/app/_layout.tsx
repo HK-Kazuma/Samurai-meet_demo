@@ -1,0 +1,75 @@
+import { Redirect, Stack, usePathname, useRouter } from "expo-router";
+import { useEffect, useRef, type ReactNode } from "react";
+import { View } from "react-native";
+import GlobalTabBar from "../components/GlobalTabBar";
+import { LoadingScreen } from "../components/ui";
+import { AuthProvider, useAuth } from "../hooks/useAuth";
+import { ThemeProvider } from "../hooks/useTheme";
+import {
+  isProtectedRoute,
+  shouldRedirectToSignedOutRoot,
+  shouldResetSignedOutNavigation,
+} from "../services/route-guard";
+
+function AuthRouteGuard({ children }: { children: ReactNode }) {
+  const pathname = usePathname();
+  const { status } = useAuth();
+
+  if (status === "loading" && isProtectedRoute(pathname)) {
+    return <LoadingScreen />;
+  }
+
+  if (shouldRedirectToSignedOutRoot(status, pathname)) {
+    return <Redirect href="/" />;
+  }
+
+  return (
+    <View style={{ flex: 1 }}>
+      {children}
+    </View>
+  );
+}
+
+function RootNavigator() {
+  const router = useRouter();
+  const { status } = useAuth();
+  const previousStatus = useRef(status);
+
+  useEffect(() => {
+    const shouldReset = shouldResetSignedOutNavigation(previousStatus.current, status);
+    previousStatus.current = status;
+    if (!shouldReset) return;
+
+    // Keep this reset above individual screens so a screen-level replace
+    // cannot unmount the logout cleanup before the old stack is removed.
+    if (router.canDismiss()) {
+      router.dismissAll();
+    }
+    router.replace("/");
+  }, [router, status]);
+
+  return (
+    <View style={{ flex: 1 }}>
+      <Stack
+        initialRouteName="index"
+        screenLayout={({ children }) => <AuthRouteGuard>{children}</AuthRouteGuard>}
+        screenOptions={{
+          animation: "default",
+          gestureEnabled: true,
+          headerShown: false,
+        }}
+      />
+      {status === "signed_in" ? <GlobalTabBar /> : null}
+    </View>
+  );
+}
+
+export default function RootLayout() {
+  return (
+    <ThemeProvider>
+      <AuthProvider>
+        <RootNavigator />
+      </AuthProvider>
+    </ThemeProvider>
+  );
+}

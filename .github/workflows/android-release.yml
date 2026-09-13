@@ -1,0 +1,307 @@
+name: Android Build & Release
+
+concurrency:
+  group: android-release-${{ github.ref }}
+  cancel-in-progress: false
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "frontend/package.json"
+      - "frontend/app.json"
+      - ".github/workflows/android-release.yml"
+  workflow_dispatch:
+    inputs:
+      is_prerelease:
+        description: "Force mark as Pre-release"
+        type: boolean
+        default: false
+      build_all_abis:
+        description: "Build for ALL architectures (including PC emulators x86/x86_64)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  build-and-release:
+    name: Build, Attest & Release Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: チェックアウト (全履歴取得)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Node.js をセットアップ
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.17.0"
+
+      - name: Bun をセットアップ
+        uses: oven-sh/setup-bun@v2
+
+      - name: Bun依存キャッシュを復元
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('frontend/bun.lock') }}
+          restore-keys: bun-${{ runner.os }}-
+
+      - name: JDK 17 をセットアップ
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Gradle をスマートセットアップ (高速ビルドキャッシュ)
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
+
+      - name: フロントエンド依存のインストール
+        working-directory: frontend
+        run: |
+          bun install --frozen-lockfile
+          if [ -f "node_modules/react-native-libsodium/libsodium/build.tgz" ] && [ ! -d "node_modules/react-native-libsodium/libsodium/build" ]; then
+            echo "Extracting libsodium native prebuilts..."
+            tar -xzf node_modules/react-native-libsodium/libsodium/build.tgz --directory node_modules/react-native-libsodium/libsodium
+          fi
+
+      - name: フロントエンド型検査
+        working-directory: frontend
+        run: bun run typecheck
+
+      - name: Expo Prebuild (Android ネイティブプロジェクト生成)
+        working-directory: frontend
+        run: bunx expo prebuild --platform android --clean
+
+      - name: Gradle 爆速チューニング & アーキテクチャ設定
+        run: |
+          if [ "${{ inputs.build_all_abis }}" = "true" ]; then
+            echo "Building for ALL architectures (arm64-v8a, armeabi-v7a, x86, x86_64)..."
+            TARGET_ARCHS="armeabi-v7a,arm64-v8a,x86,x86_64"
+            ARCH_LABEL="全アーキテクチャ (Universal / PCエミュレータ対応)"
+          else
+            echo "Building for Device-only architectures (arm64-v8a, armeabi-v7a)..."
+            TARGET_ARCHS="arm64-v8a,armeabi-v7a"
+            ARCH_LABEL="実機向け最速 (arm64-v8a, armeabi-v7a)"
+          fi
+
+          cat <<EOF >> frontend/android/gradle.properties
+          org.gradle.parallel=true
+          org.gradle.caching=true
+          org.gradle.vfs.watch=true
+          org.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1024m -XX:+HeapDumpOnOutOfMemoryError
+          reactNativeArchitectures=$TARGET_ARCHS
+          EOF
+
+          echo "ARCH_LABEL=$ARCH_LABEL" >> "$GITHUB_ENV"
+
+      - name: テスト用署名キーストアの準備
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD || 'samuraimeet' }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS || 'samuraimeet' }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD || 'samuraimeet' }}
+        run: |
+          KEYSTORE_PATH="frontend/android/app/release.keystore"
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "Using provided secret keystore..."
+            echo "$KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE_PATH"
+          else
+            echo "Generating automated test signing keystore..."
+            keytool -genkeypair -v \
+              -keystore "$KEYSTORE_PATH" \
+              -alias "$KEY_ALIAS" \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -storepass "$KEYSTORE_PASSWORD" \
+              -keypass "$KEY_PASSWORD" \
+              -dname "CN=Samurai Meet Test, OU=Dev, O=SamuraiMeet, L=Tokyo, ST=Tokyo, C=JP"
+          fi
+
+          cat <<EOF > frontend/android/release-signing.properties
+          RELEASE_STORE_FILE=release.keystore
+          RELEASE_STORE_PASSWORD=$KEYSTORE_PASSWORD
+          RELEASE_KEY_ALIAS=$KEY_ALIAS
+          RELEASE_KEY_PASSWORD=$KEY_PASSWORD
+          EOF
+
+      - name: Android Gradle ビルド (Release APK)
+        working-directory: frontend/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon
+
+      - name: 成果物の抽出と SHA-256 チェックサム生成
+        run: |
+          APK_SRC=$(find frontend/android/app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          if [ -z "$APK_SRC" ]; then
+            echo "Error: Release APK not found."
+            exit 1
+          fi
+
+          cp "$APK_SRC" samurai-meet-release.apk
+          sha256sum samurai-meet-release.apk > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: メタデータ・変更期間・Changelog の抽出と生成
+        id: metadata
+        run: |
+          # アプリバージョンの取得
+          VERSION=$(node -p "require('./frontend/package.json').version")
+          TAG_NAME="v${VERSION}"
+          FULL_SHA=$(git rev-parse HEAD)
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          CI_SHA=$(git log -n 1 --pretty=format:%h -- .github/workflows/android-release.yml 2>/dev/null || echo "$SHORT_SHA")
+          BUILD_TIME_JST=$(TZ='Asia/Tokyo' date "+%Y-%m-%d %H:%M:%S JST")
+          BUILD_TIME_UTC=$(date -u "+%Y-%m-%d %H:%M:%S UTC")
+
+          # Pre-release / RC 判定
+          IS_PRERELEASE="false"
+          if echo "$VERSION" | grep -qiE '(-rc|-alpha|-beta|-preview|-pre|\+dev)'; then
+            IS_PRERELEASE="true"
+          fi
+          if [ "${{ inputs.is_prerelease }}" = "true" ]; then
+            IS_PRERELEASE="true"
+          fi
+
+          # 前回タグまたは開始コミットの探索
+          PREV_TAG=$(git describe --tags --abbrev=0 "${TAG_NAME}^" 2>/dev/null || git describe --tags --abbrev=0 2>/dev/null || echo "")
+          if [ -n "$PREV_TAG" ]; then
+            PREV_COMMIT=$(git rev-parse "$PREV_TAG")
+            PREV_TIME_JST=$(TZ='Asia/Tokyo' date -d "$(git log -1 --format=%cd --date=iso "$PREV_COMMIT")" "+%Y-%m-%d %H:%M:%S JST" 2>/dev/null || echo "$PREV_TAG")
+            SPAN_TEXT="${PREV_TIME_JST} 〜 ${BUILD_TIME_JST}"
+            CHANGELOG_TEXT=$(git log --pretty=format:"- \`%h\` %s (@%an)" "${PREV_TAG}..HEAD")
+          else
+            FIRST_COMMIT=$(git rev-list --max-parents=0 HEAD | head -n 1)
+            PREV_TIME_JST=$(TZ='Asia/Tokyo' date -d "$(git log -1 --format=%cd --date=iso "$FIRST_COMMIT")" "+%Y-%m-%d %H:%M:%S JST" 2>/dev/null || echo "初回コミット")
+            SPAN_TEXT="${PREV_TIME_JST} 〜 ${BUILD_TIME_JST}"
+            CHANGELOG_TEXT=$(git log -n 30 --pretty=format:"- \`%h\` %s (@%an)")
+          fi
+
+          if [ -z "$CHANGELOG_TEXT" ]; then
+            CHANGELOG_TEXT="- バージョン ${VERSION} リリース"
+          fi
+
+          # 同一バージョンの再ビルド判定
+          REBUILD_NOTICE=""
+          BUILD_STATUS="✨ 初回リリース"
+          if git rev-parse -q --verify "refs/tags/${TAG_NAME}" >/dev/null 2>&1; then
+            EXISTING_TAG_SHA=$(git rev-parse "refs/tags/${TAG_NAME}" 2>/dev/null || echo "")
+            if [ "$EXISTING_TAG_SHA" != "$FULL_SHA" ]; then
+              BUILD_STATUS="🔄 再ビルド更新版 (Run #${{ github.run_number }})"
+              REBUILD_NOTICE="$(printf '> [!NOTE]\n> **🔄 再ビルド・更新版 (Updated Build)**\n> このバージョンは **%s** に最新コミット (`%s`) で再ビルド・上書き更新された最新のパッケージです。\n' "$BUILD_TIME_JST" "$SHORT_SHA")"
+            fi
+          fi
+
+          # Release Notes Markdownの生成
+          cat <<EOF > release_notes.md
+          # Samurai Meet ${TAG_NAME} $([ "$IS_PRERELEASE" = "true" ] && echo "(Pre-release / RC)" || echo "")
+
+          ${REBUILD_NOTICE}
+          ## 📋 ビルド & リリースメタデータ
+          | 項目 | 値 |
+          | :--- | :--- |
+          | **アプリバージョン** | \`${VERSION}\` |
+          | **ビルド状態** | \`${BUILD_STATUS}\` |
+          | **リリース種別** | $([ "$IS_PRERELEASE" = "true" ] && echo "⚠️ Pre-release / RC" || echo "🚀 正式リリース (Production)") |
+          | **対象アーキテクチャ** | \`${ARCH_LABEL}\` |
+          | **リリースコミット** | \`${SHORT_SHA}\` (\`${FULL_SHA}\`) |
+          | **CIワークフロー最終更新** | \`${CI_SHA}\` |
+          | **最終ビルド日時** | ${BUILD_TIME_JST} (${BUILD_TIME_UTC}) |
+          | **GitHub Actions Run** | [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
+
+          ## ⏱️ 変更期間
+          **${SPAN_TEXT}**
+
+          ## 📝 主な変更履歴 (Changelog)
+          ${CHANGELOG_TEXT}
+
+          ## 🛡️ 来歴証明 (Artifact Attestation) の検証
+          このビルド成果物は GitHub Actions により Sigstore 暗号署名付きで来歴証明（SLSA準拠）が記録されています。
+          GitHub CLI を使って改ざんされていない正規ビルドであることを検証できます:
+
+          \`\`\`bash
+          gh attestation verify samurai-meet-release.apk --repo ${{ github.repository }}
+          \`\`\`
+
+          ### SHA-256 チェックサム
+          \`\`\`text
+          $(cat SHA256SUMS)
+          \`\`\`
+          EOF
+
+          echo "TAG_NAME=$TAG_NAME" >> "$GITHUB_OUTPUT"
+          echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "IS_PRERELEASE=$IS_PRERELEASE" >> "$GITHUB_OUTPUT"
+          echo "SHORT_SHA=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+          echo "FULL_SHA=$FULL_SHA" >> "$GITHUB_OUTPUT"
+          echo "CI_SHA=$CI_SHA" >> "$GITHUB_OUTPUT"
+          echo "BUILD_TIME_JST=$BUILD_TIME_JST" >> "$GITHUB_OUTPUT"
+          echo "BUILD_STATUS=$BUILD_STATUS" >> "$GITHUB_OUTPUT"
+
+      - name: 最大レベルの来歴証明 (Artifact Attestations) を生成
+        id: attest
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            samurai-meet-release.apk
+            SHA256SUMS
+
+      - name: 来歴証明書バンドル (.intoto.jsonl) の抽出
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -n "${{ steps.attest.outputs.attestation-path }}" ] && [ -f "${{ steps.attest.outputs.attestation-path }}" ]; then
+            cp "${{ steps.attest.outputs.attestation-path }}" samurai-meet-release.apk.intoto.jsonl
+          else
+            gh attestation download samurai-meet-release.apk --repo "${{ github.repository }}" || true
+            if [ -f "attestation.jsonl" ]; then
+              mv attestation.jsonl samurai-meet-release.apk.intoto.jsonl
+            fi
+          fi
+
+      - name: GitHub Releases を作成・公開 (同名バージョンは最新コミットで上書き更新)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.metadata.outputs.TAG_NAME }}
+          target_commitish: ${{ github.sha }}
+          name: Samurai Meet ${{ steps.metadata.outputs.TAG_NAME }}
+          body_path: release_notes.md
+          prerelease: ${{ steps.metadata.outputs.IS_PRERELEASE == 'true' }}
+          draft: false
+          files: |
+            samurai-meet-release.apk
+            SHA256SUMS
+            samurai-meet-release.apk.intoto.jsonl
+
+      - name: 実行結果をサマリーへ出力
+        if: ${{ always() }}
+        run: |
+          {
+            echo "# Android Release Result"
+            echo
+            echo "| 項目 | 結果 |"
+            echo "| --- | --- |"
+            echo "| バージョン | \`${{ steps.metadata.outputs.VERSION }}\` (\`${{ steps.metadata.outputs.TAG_NAME }}\`) |"
+            echo "| 状態 | ${{ steps.metadata.outputs.BUILD_STATUS }} |"
+            echo "| 種別 | $([ "${{ steps.metadata.outputs.IS_PRERELEASE }}" = "true" ] && echo "Pre-release / RC" || echo "Production Release") |"
+            echo "| アーキテクチャ | \`${ARCH_LABEL}\` |"
+            echo "| コミット | \`${{ steps.metadata.outputs.SHORT_SHA }}\` |"
+            echo "| CI更新コミット | \`${{ steps.metadata.outputs.CI_SHA }}\` |"
+            echo "| ビルド日時 | ${{ steps.metadata.outputs.BUILD_TIME_JST }} |"
+            echo
+            echo "### 来歴証明 (Attestation) の検証"
+            echo "\`\`\`bash"
+            echo "gh attestation verify samurai-meet-release.apk --repo ${{ github.repository }}"
+            echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,385 @@
+package httpapi
+
+import (
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/Tornado2026-team-j/Samurai-meet/backend/internal/auth"
+	"github.com/Tornado2026-team-j/Samurai-meet/backend/internal/chat"
+	"github.com/Tornado2026-team-j/Samurai-meet/backend/internal/keys"
+	"github.com/Tornado2026-team-j/Samurai-meet/backend/internal/translation"
+)
+
+const chatPath = APIV1Prefix + "/chats"
+
+func chatCollection(service *chat.Service, sessions *auth.SessionService) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		claims, ok := accessClaims(r, sessions)
+		if !ok {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing_or_invalid_access_token"})
+			return
+		}
+		if service == nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "chat_unavailable"})
+			return
+		}
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		items, err := service.List(r.Context(), claims.Subject, time.Now())
+		if err != nil {
+			writeChatError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"data": items})
+	}
+}
+
+func chatItem(service *chat.Service, moderation chat.ModerationProvider, translator *translation.Service, sessions *auth.SessionService, devices *keys.DeviceService) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		claims, ok := accessClaims(r, sessions)
+		if !ok {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing_or_invalid_access_token"})
+			return
+		}
+		if service == nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "chat_unavailable"})
+			return
+		}
+		chatID, rest, ok := chatPathParts(r.URL.Path)
+		if !ok {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "chat_not_found"})
+			return
+		}
+		if len(rest) == 0 {
+			if r.Method != http.MethodGet {
+				w.Header().Set("Allow", http.MethodGet)
+				w.WriteHeader(http.StatusMethodNotAllowed)
+				return
+			}
+			summary, err := service.Get(r.Context(), claims.Subject, chatID, time.Now())
+			if err != nil {
+				writeChatError(w, err)
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"data": summary})
+			return
+		}
+		switch {
+		case rest[0] == "moderation" && len(rest) == 1:
+			chatModeration(service, moderation, sessions)(w, r)
+		case rest[0] == "translate" && len(rest) == 1:
+			chatTranslation(service, translator, service, sessions)(w, r)
+		case rest[0] == "messages" && len(rest) == 1:
+			chatMessages(w, r, service, claims.Subject, chatID)
+		case rest[0] == "messages" && len(rest) == 4 && rest[2] == "translations":
+			chatMessageTranslation(service, sessions, claims.Subject, chatID, rest[1], rest[3])(w, r)
+		case rest[0] == "messages" && len(rest) == 2:
+			chatMessageItem(w, r, service, claims.Subject, chatID, rest[1])
+		case rest[0] == "read" && len(rest) == 1:
+			chatRead(w, r, service, claims.Subject, chatID)
+		case rest[0] == "transport-token" && len(rest) == 1:
+			chatTransportToken(w, r, service, claims.Subject, claims.SessionID, chatID)
+		case rest[0] == "demo" && len(rest) == 2 && rest[1] == "peer-key":
+			chatDemoPeerKey(w, r, service, claims.Subject, chatID)
+		case rest[0] == "attachment-key-recipients" && len(rest) == 1:
+			chatAttachmentKeyRecipients(w, r, service, devices, claims, chatID)
+		case rest[0] == "key-recipients" && len(rest) == 1:
+			chatKeyRecipients(w, r, service, devices, claims, chatID)
+		case rest[0] == "key-envelope" && len(rest) == 1:
+			chatKeyEnvelope(w, r, service, devices, claims, chatID)
+		case rest[0] == "key-envelopes" && len(rest) == 1:
+			chatKeyEnvelope(w, r, service, devices, claims, chatID)
+		case rest[0] == "attachments" && len(rest) == 1:
+			chatAttachmentUpload(w, r, service, devices, claims, chatID)
+		case rest[0] == "attachments" && len(rest) == 2:
+			chatAttachmentDownload(w, r, service, devices, claims, chatID, rest[1])
+		case rest[0] == "attachments" && len(rest) == 3 && rest[2] == "envelope":
+			chatAttachmentEnvelope(w, r, service, devices, claims, chatID, rest[1])
+		case rest[0] == "attachments" && len(rest) == 3 && rest[2] == "envelopes":
+			chatAttachmentKeyEnvelopes(w, r, service, devices, claims, chatID, rest[1])
+		default:
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "chat_not_found"})
+		}
+	}
+}
+
+func chatDemoPeerKey(w http.ResponseWriter, r *http.Request, service *chat.Service, userID, chatID string) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	key, err := service.GetDemoPeerKey(r.Context(), userID, chatID, now())
+	if err != nil {
+		writeChatError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"data": key})
+}
+
+func chatMessages(w http.ResponseWriter, r *http.Request, service *chat.Service, userID, chatID string) {
+	switch r.Method {
+	case http.MethodGet:
+		after, before, limit, err := chatQuery(r)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_chat_request"})
+			return
+		}
+		var page chat.MessagePage
+		if before != nil {
+			page, err = service.ListMessagesBefore(r.Context(), userID, chatID, *before, limit, time.Now())
+		} else {
+			page, err = service.ListMessages(r.Context(), userID, chatID, after, limit, time.Now())
+		}
+		if err != nil {
+			writeChatError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"data": page})
+	case http.MethodPost:
+		var input chat.SendMessageInput
+		if err := decodeJSONRequest(w, r, &input, 192*1024); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_chat_request"})
+			return
+		}
+		message, _, err := service.SendMessage(r.Context(), userID, chatID, input, time.Now())
+		if err != nil {
+			writeChatError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusCreated, map[string]any{"data": message})
+	default:
+		w.Header().Set("Allow", "GET, POST")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func chatMessageItem(w http.ResponseWriter, r *http.Request, service *chat.Service, userID, chatID, messageID string) {
+	switch r.Method {
+	case http.MethodPatch:
+		var input chat.UpdateMessageInput
+		if err := decodeJSONRequest(w, r, &input, 192*1024); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_chat_request"})
+			return
+		}
+		message, err := service.UpdateMessage(r.Context(), userID, chatID, messageID, input, time.Now())
+		if err != nil {
+			writeChatError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"data": message})
+	case http.MethodDelete:
+		if err := service.DeleteMessage(r.Context(), userID, chatID, messageID, time.Now()); err != nil {
+			writeChatError(w, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		w.Header().Set("Allow", "PATCH, DELETE")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func chatRead(w http.ResponseWriter, r *http.Request, service *chat.Service, userID, chatID string) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	var input struct {
+		LastMessageSequence int64 `json:"last_message_sequence"`
+	}
+	if err := decodeJSONRequest(w, r, &input, 8*1024); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_chat_request"})
+		return
+	}
+	if err := service.MarkRead(r.Context(), userID, chatID, input.LastMessageSequence, time.Now()); err != nil {
+		writeChatError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func chatTransportToken(w http.ResponseWriter, r *http.Request, service *chat.Service, userID, sessionID, chatID string) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	transport := chat.QUICTransport
+	if r.Body != nil && (r.ContentLength != 0 || r.Header.Get("Transfer-Encoding") != "") {
+		var input struct {
+			Transport string `json:"transport"`
+		}
+		if err := decodeOptionalJSONRequest(w, r, &input, 8*1024); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_chat_request"})
+			return
+		}
+		if strings.TrimSpace(input.Transport) != "" {
+			transport = input.Transport
+		}
+	}
+	token, err := service.IssueTransportToken(r.Context(), userID, sessionID, chatID, transport, time.Now())
+	if err != nil {
+		writeChatError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"data": token})
+}
+
+func chatQuery(r *http.Request) (int64, *int64, int, error) {
+	after := int64(0)
+	if value := strings.TrimSpace(r.URL.Query().Get("after")); value != "" {
+		parsed, err := strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			return 0, nil, 0, err
+		}
+		if parsed < 0 {
+			return 0, nil, 0, errors.New("after must not be negative")
+		}
+		after = parsed
+	}
+	var before *int64
+	if value := strings.TrimSpace(r.URL.Query().Get("before")); value != "" {
+		parsed, err := strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			return 0, nil, 0, err
+		}
+		if parsed < 0 {
+			return 0, nil, 0, errors.New("before must not be negative")
+		}
+		if strings.TrimSpace(r.URL.Query().Get("after")) != "" {
+			return 0, nil, 0, errors.New("after and before cannot be combined")
+		}
+		before = &parsed
+	}
+	limit := 0
+	if value := strings.TrimSpace(r.URL.Query().Get("limit")); value != "" {
+		parsed, err := strconv.Atoi(value)
+		if err != nil {
+			return 0, nil, 0, err
+		}
+		if parsed < 1 || parsed > 100 {
+			return 0, nil, 0, errors.New("limit must be between 1 and 100")
+		}
+		limit = parsed
+	}
+	return after, before, limit, nil
+}
+
+func chatPathParts(path string) (string, []string, bool) {
+	trimmed := strings.Trim(strings.TrimPrefix(path, chatPath+"/"), "/")
+	if trimmed == "" {
+		return "", nil, false
+	}
+	parts := strings.Split(trimmed, "/")
+	if len(parts) > 5 {
+		return "", nil, false
+	}
+	for _, part := range parts {
+		if part == "" {
+			return "", nil, false
+		}
+	}
+	chatID, err := url.PathUnescape(parts[0])
+	if err != nil || chatID == "" {
+		return "", nil, false
+	}
+	rest := parts[1:]
+	for index, part := range rest {
+		tail, err := url.PathUnescape(part)
+		if err != nil || tail == "" || strings.Contains(tail, "/") {
+			return "", nil, false
+		}
+		rest[index] = tail
+	}
+	return chatID, rest, true
+}
+
+func decodeOptionalJSONRequest(w http.ResponseWriter, r *http.Request, destination any, maxBytes int64) error {
+	if r.Body == nil {
+		return nil
+	}
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBytes))
+	if err := decoder.Decode(destination); errors.Is(err, io.EOF) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	return ensureJSONBodyConsumed(decoder)
+}
+
+func writeChatError(w http.ResponseWriter, err error) {
+	status := http.StatusInternalServerError
+	code := "chat_failed"
+	if rateLimited := (*chat.RateLimitError)(nil); errors.As(err, &rateLimited) {
+		seconds := int(rateLimited.RetryAfter.Round(time.Second) / time.Second)
+		if seconds < 1 {
+			seconds = 1
+		}
+		w.Header().Set("Retry-After", strconv.Itoa(seconds))
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "chat_rate_limited"})
+		return
+	}
+	if translationRateLimited := (*chat.TranslationRateLimitError)(nil); errors.As(err, &translationRateLimited) {
+		seconds := int(translationRateLimited.RetryAfter.Round(time.Second) / time.Second)
+		if seconds < 1 {
+			seconds = 1
+		}
+		w.Header().Set("Retry-After", strconv.Itoa(seconds))
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "chat_translation_rate_limited"})
+		return
+	}
+	switch {
+	case errors.Is(err, chat.ErrChatInvalidInput):
+		status, code = http.StatusBadRequest, "invalid_chat_request"
+	case errors.Is(err, chat.ErrMessageTooLarge):
+		status, code = http.StatusRequestEntityTooLarge, "chat_message_too_large"
+	case errors.Is(err, chat.ErrChatAttachmentTooLarge):
+		status, code = http.StatusRequestEntityTooLarge, "chat_attachment_too_large"
+	case errors.Is(err, chat.ErrChatNotFound), errors.Is(err, chat.ErrChatBlocked), errors.Is(err, chat.ErrMessageNotFound), errors.Is(err, chat.ErrChatAttachmentNotFound):
+		status, code = http.StatusNotFound, "chat_not_found"
+	case errors.Is(err, chat.ErrChatForbidden):
+		status, code = http.StatusForbidden, "chat_forbidden"
+	case errors.Is(err, chat.ErrChatNotAvailable):
+		status, code = http.StatusConflict, "chat_not_available"
+	case errors.Is(err, chat.ErrTooManyPendingAttachments):
+		status, code = http.StatusConflict, "too_many_pending_attachments"
+	case errors.Is(err, chat.ErrChatAttachmentKeysMissing):
+		status, code = http.StatusConflict, "chat_attachment_keys_unavailable"
+	case errors.Is(err, chat.ErrChatKeyEnvelopeMissing):
+		status, code = http.StatusConflict, "chat_key_recipients_unavailable"
+	case errors.Is(err, chat.ErrChatKeyEnvelopeConflict):
+		status, code = http.StatusConflict, "chat_key_envelope_conflict"
+	case errors.Is(err, chat.ErrChatKeyEnvelopeAuthority):
+		status, code = http.StatusForbidden, "chat_key_envelope_authority_required"
+	case errors.Is(err, chat.ErrMessageTranslationStale):
+		status, code = http.StatusConflict, "chat_translation_stale"
+	case errors.Is(err, chat.ErrTranslationBindingMissing):
+		status, code = http.StatusConflict, "chat_translation_binding_unavailable"
+	case errors.Is(err, chat.ErrTranslationBindingMismatch):
+		status, code = http.StatusBadRequest, "chat_translation_message_mismatch"
+	case errors.Is(err, chat.ErrTranslationLimiterUnavailable):
+		status, code = http.StatusServiceUnavailable, "chat_translation_unavailable"
+	case errors.Is(err, chat.ErrChatSignerMissing):
+		status, code = http.StatusServiceUnavailable, "chat_transport_unavailable"
+	case errors.Is(err, chat.ErrChatAttachmentUnavailable):
+		status, code = http.StatusServiceUnavailable, "chat_attachment_unavailable"
+	case errors.Is(err, chat.ErrDemoKeyNotFound):
+		status, code = http.StatusConflict, "demo_peer_key_unavailable"
+	case errors.Is(err, chat.ErrDemoKeyForbidden):
+		status, code = http.StatusForbidden, "demo_key_forbidden"
+	case errors.Is(err, chat.ErrDemoKeyConflict):
+		status, code = http.StatusConflict, "demo_device_key_conflict"
+	}
+	writeJSON(w, status, map[string]string{"error": code})
+}

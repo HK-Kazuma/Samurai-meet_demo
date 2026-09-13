@@ -1,0 +1,65 @@
+{
+  "expo": {
+    "name": "Samurai Meet",
+    "slug": "samurai-meet",
+    "owner": "disnanas-team",
+    "scheme": "samuraimeet",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "experiments": {
+      "typedRoutes": true
+    },
+    "android": {
+      "package": "com.samuraimeet.app",
+      "versionCode": 1,
+      "adaptiveIcon": {
+        "backgroundColor": "#0F172A"
+      },
+      "permissions": [
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_FINE_LOCATION",
+        "RECEIVE_BOOT_COMPLETED"
+      ]
+    },
+    "plugins": [
+      "expo-router",
+      "expo-secure-store",
+      "expo-web-browser",
+      "expo-font",
+      "expo-notifications",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Samurai Meet uses your camera to capture memories after a guide."
+        }
+      ],
+      [
+        "expo-media-library",
+        {
+          "photosPermission": "Samurai Meet uses your photos only when saving generated memory characters.",
+          "savePhotosPermission": "Samurai Meet saves generated memory characters to your photos when you choose to save them.",
+          "granularPermissions": [
+            "photo"
+          ]
+        }
+      ],
+      "react-native-libsodium",
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Samurai Meet uses your photos to send encrypted chat attachments."
+        }
+      ],
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "Samurai Meet uses your location to find nearby recruitments."
+        }
+      ],
+      "@react-native-community/datetimepicker",
+      "expo-localization",
+      "expo-status-bar"
+    ]
+  }
+}

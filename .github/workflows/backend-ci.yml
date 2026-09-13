@@ -1,0 +1,121 @@
+name: Backend CI
+
+concurrency:
+  group: backend-ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Go quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - name: チェックアウト
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Go をセットアップ
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+          check-latest: true
+          cache: true
+      - name: フォーマットを検査
+        run: test -z "$(gofmt -l $(find . -name '*.go' -type f))"
+      - name: 静的検査
+        run: go vet ./...
+      - name: 単体テスト
+        run: go test ./... -short
+      - name: ビルド
+        run: go build ./cmd/server
+
+  integration:
+    name: PostgreSQL integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: backend
+    env:
+      TEST_POSTGRES: "1"
+      RUN_DATABASE_SMOKE_TEST: "1"
+      DB_HOST: 127.0.0.1
+      DB_PORT: "5432"
+      DB_NAME: samurai_meet
+      DB_USER: samurai_meet_app
+      DB_PASSWORD: samurai_meet_password
+      DB_SSLMODE: disable
+      DB_SCHEMA: public
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: samurai_meet
+          POSTGRES_USER: samurai_meet_app
+          POSTGRES_PASSWORD: samurai_meet_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U samurai_meet_app -d samurai_meet"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: チェックアウト
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Go をセットアップ
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+          check-latest: true
+          cache: true
+      - name: Python をセットアップ
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: PostgreSQL 統合テスト
+        run: go test ./...
+      - name: API スモークテスト
+        run: python tests/frontend_smoke_test.py
+      - name: 開発用鍵生成スクリプトをテスト
+        run: python -m unittest discover -s scripts -p "test_*.py"
+
+  report:
+    name: CI report
+    if: ${{ always() }}
+    needs: [quality, integration]
+    runs-on: ubuntu-latest
+    steps:
+      - name: 実行結果をサマリーへ出力
+        env:
+          QUALITY: ${{ needs.quality.result }}
+          INTEGRATION: ${{ needs.integration.result }}
+        run: |
+          {
+            echo "# Backend CI"
+            echo
+            echo "| 検査 | 結果 |"
+            echo "| --- | --- |"
+            echo "| Go quality | ${QUALITY} |"
+            echo "| PostgreSQL integration | ${INTEGRATION} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: 失敗時に集約チェックを失敗させる
+        if: ${{ needs.quality.result != 'success' || needs.integration.result != 'success' }}
+        run: exit 1
