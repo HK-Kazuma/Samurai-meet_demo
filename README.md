@@ -1,5 +1,5 @@
 # Samurai Meet
-
+English follows Japanese
 [🇯🇵 日本語](README.md) | [🇬🇧 English](README.en.md)
 
 日本国内で、短い空き時間に近くの日本人・外国人が交流相手を募集し、条件が合えばマッチングするアプリです。正式な実装契約は [docs/README.md](docs/README.md)、Go APIの厳密な契約は [backend/API_SPEC.md](backend/API_SPEC.md) を参照してください。
