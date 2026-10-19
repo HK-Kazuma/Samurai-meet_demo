@@ -37,7 +37,7 @@ jobs:
   osv-pr:
     name: OSV dependency vulnerability scan
     if: ${{ github.event_name == 'pull_request' }}
-    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@6e4298ebc4db23e847df9b2e2de2939d6f066c67 # v2.5.1
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@b1d267aea5211fa648d9d442fa64b90dbdcbdd36 # v2.7.0
     permissions:
       actions: read
       contents: read
@@ -52,7 +52,7 @@ jobs:
   osv-full:
     name: OSV full vulnerability scan
     if: ${{ github.event_name != 'pull_request' }}
-    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@6e4298ebc4db23e847df9b2e2de2939d6f066c67 # v2.5.1
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@b1d267aea5211fa648d9d442fa64b90dbdcbdd36 # v2.7.0
     permissions:
       actions: read
       contents: read
@@ -107,7 +107,7 @@ jobs:
           persist-credentials: false
 
       - name: 秘密情報の混入を検査
-        uses: trufflesecurity/trufflehog@bcfcf73aaf4759d4dadc2783177c245a02792318 # v3.97.0
+        uses: trufflesecurity/trufflehog@e76dff8a7e57d6df0c60ad8cbf5d5cba505a8fc9 # v3.99.2
         with:
           version: 3.97.0
 
@@ -124,7 +124,7 @@ jobs:
           persist-credentials: false
 
       - name: GitHub Actions ワークフローを静的検査
-        uses: zizmorcore/zizmor-action@3dc1ecc9bcb9e94e9b2c709687979e1298497054 # v0.6.2
+        uses: zizmorcore/zizmor-action@cc914d7f3750a2d13d75c7f184a1060aa0e9d482 # v0.6.4
 
   report:
     name: Security report
